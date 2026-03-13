@@ -99,7 +99,7 @@ Open `script/values.sh` in a text editor and fill in the required values. Key va
 *   `SERVICE_ACCOUNT`: The service account the Cloud Run service will use.
 *   `LOCATION`: The Google Cloud region where you want to deploy (e.g., `us-central1`).
 *   `GENESYS_API_KEY_SECRET_PATH`: The full resource path to the Secret Manager secret containing the API key that Genesys will use to connect. **Ensure this secret exists and has a value configured.**
-*   `GENESYS_CLIENT_SECRET_PATH`: The full resource path to the Secret Manager secret containing the client secret for request signature verification.
+*   `GENESYS_CLIENT_SECRET_PATH`: The full resource path to the Secret Manager secret containing the client secret for request signature verification. **Note: The client secret value must be base-64 encoded.**
 *   `LOG_UNREDACTED_DATA`: Set to `true` to log unredacted data from Genesys and CES. Otherwise, sensitive information will be redacted (e.g., `<REDACTED>`). Defaults to `false`.
     **Caution**: This option should typically only be used for local development and debugging purposes. Avoid enabling it in production environments to prevent exposure of sensitive data.
 
