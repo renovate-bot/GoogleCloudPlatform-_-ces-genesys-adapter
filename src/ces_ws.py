@@ -1,11 +1,11 @@
 # Copyright 2025 Google LLC
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     https://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -24,6 +24,7 @@ from websockets.connection import State
 
 from .auth import auth_provider
 from .redaction import redact, redact_value
+from .config import DISCONNECT_EVENT_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class CESWS:
         self.audio_out_queue = asyncio.Queue() # CES to Genesys
         self._stop_pacer_event = asyncio.Event()
         self.pacer_task = None
+        self.endsession_received = False
 
     def _get_log_extra(self, log_type: str, data: dict = None):
         extra = {
@@ -190,6 +192,24 @@ class CESWS:
         else:
             logger.warning("Cannot send DTMF, CES WS not connected", extra=self._get_log_extra(log_type="ces_send_dtmf_error", data={"digit": redact_value(digit)}))
 
+    async def send_genesys_disconnect_event(self):
+        logger.info(f"Attempting to send '{DISCONNECT_EVENT_NAME}' event to CES", extra=self._get_log_extra(log_type="ces_send_event"))
+        event_message = {
+            "realtimeInput": {
+                "event": {
+                    "event": DISCONNECT_EVENT_NAME
+                }
+            }
+        }
+        if self.is_connected():
+            try:
+                await self.websocket.send(json.dumps(event_message))
+                logger.info(f"Sent '{DISCONNECT_EVENT_NAME}' event to CES", extra=self._get_log_extra(log_type="ces_send_event_success", data=event_message))
+            except Exception as e:
+                logger.error(f"Error sending '{DISCONNECT_EVENT_NAME}' event to CES", exc_info=True, extra=self._get_log_extra(log_type="ces_send_event_error"))
+        else:
+            logger.warning("Cannot send event, CES WS not connected", extra=self._get_log_extra(log_type="ces_send_event_skip"))
+
     async def stop_audio(self):
         logger.info("Stopping audio pacer and clearing queues", extra=self._get_log_extra(log_type="ces_pacer_stop"))
         self._stop_pacer_event.set()
@@ -256,9 +276,15 @@ class CESWS:
 
                 elif "endSession" in data:
                     logger.info("Received endSession from CES", extra=self._get_log_extra(log_type="ces_recv_endsession", data={"data": data}))
+                    self.endsession_received = True
                     metadata = data.get("endSession", {}).get("metadata", {})
                     params = metadata.get("params")
-                    if not self.genesys_ws.disconnect_initiated:
+                    if self.genesys_ws.genesys_close_pending and not self.genesys_ws.ces_data_received.is_set():
+                        logger.info("CES endSession: Genesys close is pending, sending final data.", extra=self._get_log_extra(log_type="ces_endsession_final_data"))
+                        final_data = {"info": "Session ended in CES.", "output_variables": params if params else {}}
+                        self.genesys_ws.ces_final_data = final_data
+                        self.genesys_ws.ces_data_received.set()
+                    elif not self.genesys_ws.disconnect_initiated:
                         asyncio.create_task(self.genesys_ws.send_disconnect("completed", info="Session has ended successfully in CES", output_variables=params))
                     await self.close() # Close CES connection
                     break # Exit listener loop
@@ -275,11 +301,13 @@ class CESWS:
                 logger.warning("CES WS connection closed unexpectedly", extra=self._get_log_extra(log_type="ces_connection_closed", data={"code": e.code, "reason": e.reason, "exc": str(e)}))
                 if not self.genesys_ws.disconnect_initiated:
                      await self.genesys_ws.send_disconnect("error", info=f"CES WS Closed: {e.code}")
+                self.genesys_ws.ces_data_received.set()
                 break
             except Exception as e:
                 logger.error("Error in CES listener", extra=self._get_log_extra(log_type="ces_listener_error"), exc_info=True)
                 if not self.genesys_ws.disconnect_initiated:
                     await self.genesys_ws.send_disconnect("error", info=f"CES Listen Error: {e}")
+                self.genesys_ws.ces_data_received.set()
                 break
 
     async def pacer(self):
