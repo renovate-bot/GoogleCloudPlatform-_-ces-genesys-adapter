@@ -46,6 +46,7 @@ class CESWS:
         self._stop_pacer_event = asyncio.Event()
         self.pacer_task = None
         self.endsession_received = False
+        self.final_params = {}
 
     def _get_log_extra(self, log_type: str, data: dict = None):
         extra = {
@@ -224,33 +225,49 @@ class CESWS:
             self.pacer_task = None
 
         # Clear any remaining items in the OUTBOUND queue (CES to Genesys)
+        cleared_outbound_count = 0
         while not self.audio_out_queue.empty():
             try:
                 self.audio_out_queue.get_nowait()
                 self.audio_out_queue.task_done()
+                cleared_outbound_count += 1
             except asyncio.QueueEmpty:
                 break
             except ValueError:
                 break
-        logger.info("Audio OUTBOUND queue cleared", extra=self._get_log_extra(log_type="ces_pacer_stop"))
+        if cleared_outbound_count > 0:
+            logger.info(f"Audio OUTBOUND queue cleared: discarded {cleared_outbound_count} chunks", extra=self._get_log_extra(log_type="ces_pacer_stop", data={"cleared_count": cleared_outbound_count}))
+        else:
+            logger.info("Audio OUTBOUND queue is empty", extra=self._get_log_extra(log_type="ces_pacer_stop"))
 
         # Clear any remaining items in the INBOUND queue (Genesys to CES)
+        cleared_inbound_count = 0
         while not self.audio_in_queue.empty():
             try:
                 self.audio_in_queue.get_nowait()
-                self.audio_in_queue.task_done()  # Call task_done for consistency
+                self.audio_in_queue.task_done()
+                cleared_inbound_count += 1
             except asyncio.QueueEmpty:
                 break
             except ValueError:
-                 # Should not happen if task_done is only called here for this queue
-                 pass
-        logger.info("Audio INBOUND queue cleared", extra=self._get_log_extra(log_type="ces_inbound_queue_clear"))
+                pass
+        if cleared_inbound_count > 0:
+            logger.info(f"Audio INBOUND queue cleared: discarded {cleared_inbound_count} chunks", extra=self._get_log_extra(log_type="ces_inbound_queue_clear", data={"cleared_count": cleared_inbound_count}))
+        else:
+            logger.info("Audio INBOUND queue is empty", extra=self._get_log_extra(log_type="ces_inbound_queue_clear"))
 
     async def listen(self):
         while self.is_connected():
             try:
                 logger.debug("CES WS: Waiting for message...", extra=self._get_log_extra(log_type="ces_recv_wait"))
-                message = await self.websocket.recv()
+                if self.endsession_received:
+                    try:
+                        message = await asyncio.wait_for(self.websocket.recv(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        logger.info("Timeout waiting for audio after endSession. Exiting listen loop.", extra=self._get_log_extra(log_type="ces_listen_timeout"))
+                        break
+                else:
+                    message = await self.websocket.recv()
                 data = json.loads(message)
 
                 if "interruptionSignal" in data:
@@ -285,9 +302,9 @@ class CESWS:
                         self.genesys_ws.ces_final_data = final_data
                         self.genesys_ws.ces_data_received.set()
                     elif not self.genesys_ws.disconnect_initiated:
-                        asyncio.create_task(self.genesys_ws.send_disconnect("completed", info="Session has ended successfully in CES", output_variables=params))
-                    await self.close() # Close CES connection
-                    break # Exit listener loop
+                        # Save params for finalization after loop
+                        self.final_params = params if params else {}
+                        logger.info("CES endSession: Waiting for final audio...", extra=self._get_log_extra(log_type="ces_endsession_wait_audio"))
 
                 elif "recognitionResult" in data:
                     pass
@@ -309,6 +326,18 @@ class CESWS:
                     await self.genesys_ws.send_disconnect("error", info=f"CES Listen Error: {e}")
                 self.genesys_ws.ces_data_received.set()
                 break
+                
+        # Loop exited (either by timeout or connection closed)
+        logger.info("Exited listen loop, waiting for pacer to drain...", extra=self._get_log_extra(log_type="ces_listen_exit"))
+        
+        if self.pacer_task:
+            try:
+                await self.pacer_task # Wait for pacer to drain naturally
+            except Exception as e:
+                logger.error(f"Error waiting for pacer to drain: {e}", exc_info=True, extra=self._get_log_extra(log_type="ces_finalize_error"))
+                
+        if self.endsession_received and not self.genesys_ws.disconnect_initiated:
+            await self.genesys_ws.send_disconnect("completed", info="Session has ended successfully in CES", output_variables=self.final_params)
 
     async def pacer(self):
         logger.info("Starting audio pacer for Genesys", extra=self._get_log_extra(log_type="ces_pacer_start"))
@@ -321,6 +350,9 @@ class CESWS:
 
         try:
             while not self._stop_pacer_event.is_set():
+                if self.endsession_received and self.audio_out_queue.empty() and not send_buffer:
+                    logger.info("Audio queue drained after endSession, stopping pacer.", extra=self._get_log_extra(log_type="ces_pacer_drained"))
+                    break
                 audio_chunk = None
                 try:
                     audio_chunk = await asyncio.wait_for(self.audio_out_queue.get(), timeout=QUEUE_GET_TIMEOUT)

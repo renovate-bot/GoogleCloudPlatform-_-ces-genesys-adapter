@@ -4,6 +4,9 @@ __pycache__/
 
 # Custom
 .env
+script/deploy-renibot.sh
+script/values-renibot.sh
 script/values.sh
+script/values-pakminw.sh
+script/deploy-pakminw.sh
 tmp
-test_logs/
