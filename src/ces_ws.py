@@ -148,7 +148,9 @@ class CESWS:
         else:
             kickstart_message = {
                 "realtimeInput": {
-                    "event": "session_start"
+                    "event": {
+                        "event": "session_start"
+                    }
                 }
             }
             log_message = "Sent session_start event to CES"
